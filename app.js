@@ -93,7 +93,7 @@
   const S = {
     token: '', usuario: null, medicos: [], motivos: [], hoy: '', filas: new Map(), repetidos: new Set(),
     desde: '', sincronizado: '', cargando: false, errorCarga: '', ui: {}, reportes: new Map(), stats: null, usuarios: null,
-    form: null, detalleAbierto: null
+    form: null, detalleAbierto: null, plantillas: [], estudiosConReporte: [], estadoReportes: null
   };
 
   /* ============================== utilidades ============================== */
@@ -186,7 +186,7 @@
   function abrirModal(contenido, opciones) {
     const o = opciones || {};
     const velo = h('div', { class: 'velo', role: 'dialog', 'aria-modal': 'true' });
-    let cerrado = false;
+    let cerrado = false, preguntando = false;
     const cerrar = function () {
       if (cerrado) return;
       cerrado = true;
@@ -194,8 +194,14 @@
       if (!modalesAbiertos()) document.body.style.overflow = '';
       if (o.alCerrar) o.alCerrar();
     };
-    const intentarCerrar = function () { if (!o.antesDeCerrar || o.antesDeCerrar()) cerrar(); };
-    const tecla = function (ev) { if (ev.key === 'Escape' && $capas.lastChild === velo && !document.querySelector('.visor, .capa.editor')) intentarCerrar(); };
+    // o.antesDeCerrar() puede devolver false (o una promesa) para que el modal siga abierto, p. ej. con un comentario sin guardar.
+    const intentarCerrar = function () {
+      if (!o.antesDeCerrar) { cerrar(); return; }
+      if (preguntando || cerrado) return;
+      preguntando = true;
+      Promise.resolve(o.antesDeCerrar()).then(function (ok) { preguntando = false; if (ok) cerrar(); });
+    };
+    const tecla = function (ev) { if (ev.key === 'Escape' && $capas.lastChild === velo && !document.querySelector('.visor, .capa.editor, .espera')) intentarCerrar(); };
     velo.addEventListener('mousedown', function (ev) { if (ev.target === velo) intentarCerrar(); });
     document.addEventListener('keydown', tecla);
     velo.appendChild(typeof contenido === 'function' ? contenido(cerrar, intentarCerrar) : contenido);
@@ -250,7 +256,8 @@
     S.filas = new Map();
     S.reportes.forEach(function (a) { URL.revokeObjectURL(a.url); });
     S.reportes = new Map();
-    S.stats = S.usuarios = S.form = null;
+    S.stats = S.usuarios = S.form = S.estadoReportes = null;
+    S.plantillas = [];
     S.sincronizado = '';
     S.desde = '';
     guardarToken('');
@@ -332,7 +339,7 @@
     o.repTipo = o.reporte ? r[0] : '';
     o.repFecha = o.reporte ? r[1] || '' : '';
     o.repUsuario = o.reporte ? r[2] || '' : '';
-    o.busca = norm(o.nombre + ' ' + o.expediente + ' ' + o.procedencia + ' ' + o.id + ' ' + o.estudio + ' ' + o.hallazgos);
+    o.busca = norm(o.nombre + ' ' + o.expediente + ' ' + o.procedencia + ' ' + o.id + ' ' + o.estudio + ' ' + o.hallazgos + ' ' + o.comentario);
     return o;
   }
   function integrarFila(cols, arr) { const o = aObjeto(cols, arr); S.filas.set(o.id, o); return o; }
@@ -371,6 +378,8 @@
     S.medicos = r.medicos;
     S.motivos = r.motivos_no;
     S.hoy = r.fecha;
+    S.plantillas = r.plantillas || [];
+    S.estudiosConReporte = r.estudios_con_reporte || [];
     return r;
   }
   /** Trae del servidor los últimos días. Lo más antiguo ya cargado se conserva. */
@@ -423,7 +432,7 @@
     return h('header', { class: 'barra' }, h('div', { class: 'barra-int' },
       conVolver ? h('a', { class: 'btn-barra', href: '#/' }, '‹ Inicio') : h('img', { class: 'logo', src: 'icons/icon-192.png', alt: '' }),
       h('h1', null, titulo, sub ? h('small', null, sub) : null),
-      h('button', { class: 'btn-barra no-imprimir', title: 'Actualizar datos', onclick: function () { S.stats = S.usuarios = null; sincronizar(); } }, '↻', h('span', { class: 'txt' }, S.cargando ? ' Actualizando…' : ' Actualizar')),
+      h('button', { class: 'btn-barra no-imprimir', title: 'Actualizar datos', onclick: function () { S.stats = S.usuarios = S.estadoReportes = null; sincronizar(); } }, '↻', h('span', { class: 'txt' }, S.cargando ? ' Actualizando…' : ' Actualizar')),
       h('button', { class: 'btn-barra no-imprimir', onclick: menuCuenta, 'aria-label': 'Mi cuenta' }, S.usuario ? S.usuario.usuario : '')));
   }
   function ruta() { return location.hash.replace(/^#\/?/, '').split('/'); }
@@ -465,6 +474,7 @@
     const recientes = todas.filter(function (f) { return f.fecha_estudio >= desde30 && f.fecha_estudio <= hoy(); });
     const sinMedico = recientes.filter(function (f) { return f.estado === 'PENDIENTE'; }).length;
     const sinReporte = recientes.filter(function (f) { return f.estado === 'REALIZADO' && !f.reporte; }).length;
+    const nRevisar = todas.filter(porRevisar).length;
     const sinDatos = !S.sincronizado;
     const tarjeta = function (href, clase, ico, nombre, cifra, cifraNota, nota) {
       return h('a', { class: 'modulo ' + clase, href: href }, h('div', { class: 'ico', 'aria-hidden': 'true' }, ico), h('div', { class: 'nombre' }, nombre),
@@ -474,12 +484,17 @@
     agregar(main, [
       h('div', { class: 'saludo' }, h('h2', null, 'Hola, ' + S.usuario.nombre),
         h('span', null, S.sincronizado ? plural(deHoy.length, 'estudio registrado', 'estudios registrados') + ' hoy · actualizado a las ' + S.sincronizado : 'Cargando registros…')),
+      nRevisar ? h('a', { class: 'aviso alerta aviso-enlace', id: 'aviso-revisar', href: '#/censo', onclick: function () {
+        const u = uiCenso();
+        Object.assign(u, { falta: 'revisar', q: '', estudio: '', proc: '', medico: '', reporte: '', anulados: false, rapido: '', desde: S.desde > '0000-01-01' ? S.desde : '', hasta: '' });
+      } }, h('b', null, plural(nRevisar, 'reporte de ecocardiograma por revisar', 'reportes de ecocardiograma por revisar') + '.'),
+        ' Se encontraron reportes en la carpeta del ecógrafo que podrían corresponder a estos pacientes, pero no coinciden todos los datos. Toque aquí para revisarlos.') : null,
       h('div', { class: 'modulos' },
         tarjeta('#/registro', 'principal', '+', 'Registro', null, '', 'Registrar un paciente y sus estudios'),
         tarjeta('#/censo', '', '≡', 'Censo', deHoy.length, deHoy.length === 1 ? 'estudio hoy' : 'estudios hoy',
           (sinMedico || sinReporte) ? 'Últimos 30 días: ' + sinMedico + ' sin médico · ' + sinReporte + ' sin reporte' : 'Últimos 30 días: todo completo'),
         tarjeta('#/estadisticas', '', '▤', 'Estadísticas', null, '', 'Por estudio, médico, edad, sexo, procedencia y hallazgos'),
-        esAdmin() ? tarjeta('#/admin', '', '☰', 'Usuarios y médicos', null, '', 'Cuentas de acceso y lista de médicos') : null),
+        esAdmin() ? tarjeta('#/admin', '', '☰', 'Usuarios y médicos', null, '', 'Cuentas, médicos, plantillas de comentario y censo de reportes') : null),
       S.form && S.form.sucio && !S.form.enviado ? h('div', { class: 'aviso info' }, 'Tiene un registro sin guardar. ', h('a', { href: '#/registro' }, 'Volver al registro')) : null
     ]);
   }
@@ -1284,7 +1299,7 @@
       h('ul', null, regs.map(function (f) {
         return h('li', null, h('span', { class: 'folio' }, f.id), h('span', { style: 'flex:1' }, f.estudio || 'Sin estudio'),
           f.estado === 'REALIZADO' ? h('span', { class: 'chip ok' }, f.realizado_por) : f.estado === 'NO REALIZADO' ? h('span', { class: 'chip gris' }, f.motivo_no) : h('span', { class: 'chip alerta' }, 'Sin médico'),
-          f.reporte ? h('span', { class: 'chip ok' }, 'Con reporte') : h('span', { class: 'chip gris' }, 'Sin reporte'));
+          f.reporte ? h('span', { class: 'chip ok' }, 'Con reporte') : h('span', { class: 'chip gris' }, conCensoReportes(f) ? 'Reporte: se buscará en la carpeta del ecógrafo' : 'Sin reporte'));
       })),
       h('div', { class: 'acciones' },
         h('button', { class: 'btn primario', id: 'btn-nuevo', onclick: function () { S.form = nuevoFormulario(); pintar(); window.scrollTo(0, 0); } }, 'Nuevo registro'),
@@ -1335,13 +1350,29 @@
   }
 
   /* ---- reportes en el censo ---- */
+  const TEXTO_REPORTE = { 'AUTOMÁTICO': 'Vinculado automáticamente', 'CONFIRMADO': 'Del censo, confirmado', 'CARGADO': 'Cargado a mano', 'POR REVISAR': 'Por revisar' };
+  /** ¿Este estudio busca su reporte en el censo de la carpeta del ecógrafo? */
+  function conCensoReportes(f) { return S.estudiosConReporte.indexOf(f.estudio) >= 0; }
+  /** ¿El reporte actual viene del censo del ecógrafo? (esos archivos nunca se borran) */
+  function esDelCenso(f) { return ['AUTOMÁTICO', 'POR REVISAR', 'CONFIRMADO'].indexOf(f.reporte_estado) >= 0; }
+  function porRevisar(f) { return f.reporte_estado === 'POR REVISAR' && !f.anulado; }
+  function conReporte(f) { return !!f.reporte && f.reporte_estado !== 'POR REVISAR'; }
+  function chipReporte(f) {
+    if (!f.reporte) return null;
+    return h('span', { class: 'chip ' + (porRevisar(f) ? 'alerta' : 'ok') }, TEXTO_REPORTE[f.reporte_estado] || 'Cargado a mano');
+  }
   function celdaReporte(f) {
+    if (porRevisar(f)) {
+      return h('button', { class: 'btn btn-rep revisar', title: 'Se encontró un reporte que podría ser de este paciente. Revíselo y confírmelo.',
+        onclick: function (ev) { ev.stopPropagation(); verReporte(f); } }, 'Revisar reporte');
+    }
     if (f.reporte) {
-      return h('button', { class: 'btn btn-rep tiene', title: 'Reporte cargado el ' + fechaHora(f.repFecha) + ' por ' + f.repUsuario,
-        onclick: function (ev) { ev.stopPropagation(); verReporte(f); } }, (f.repTipo === 'pdf' ? 'PDF' : 'Imagen') + ' · Ver');
+      return h('button', { class: 'btn btn-rep tiene', title: (TEXTO_REPORTE[f.reporte_estado] || 'Cargado a mano') + ' · ' + fechaHora(f.repFecha) + ' · ' + f.repUsuario,
+        onclick: function (ev) { ev.stopPropagation(); verReporte(f); } }, (f.repTipo === 'pdf' ? 'PDF' : 'Imagen') + ' · Ver ✓');
     }
     if (f.anulado) return h('span', { class: 'tenue' }, '—');
-    return h('button', { class: 'btn btn-rep falta', onclick: function (ev) { ev.stopPropagation(); subirReporte(f); } }, '+ Subir reporte');
+    return h('button', { class: 'btn btn-rep falta', title: 'Subir una foto o un PDF del reporte' + (conCensoReportes(f) ? '. El reporte del ecógrafo también se busca solo cada hora.' : ''),
+      onclick: function (ev) { ev.stopPropagation(); subirReporte(f); } }, '+ Subir reporte');
   }
   /** Elige archivo → (si es imagen) editor → sube. */
   async function subirReporte(f, archivoListo) {
@@ -1371,19 +1402,21 @@
   function olvidarReporte(id) {
     S.reportes.forEach(function (a, k) { if (k.indexOf(id + '|') === 0) { URL.revokeObjectURL(a.url); S.reportes.delete(k); } });
   }
-  async function obtenerReporte(f) {
-    const llave = f.id + '|' + f.reporte;
-    if (S.reportes.has(llave)) return S.reportes.get(llave);
-    const d = await api('reporte.obtener', { id: f.id });
+  function aBlob(d) {
     const bin = atob(d.b64);
     const bytes = new Uint8Array(bin.length);
     for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
     const blob = new Blob([bytes], { type: d.tipo });
-    const a = { url: URL.createObjectURL(blob), blob: blob, tipo: d.tipo, nombre: d.nombre };
+    return { url: URL.createObjectURL(blob), blob: blob, tipo: d.tipo, nombre: d.nombre };
+  }
+  async function guardarEnMemoria(llave, pedir) {
+    if (S.reportes.has(llave)) return S.reportes.get(llave);
+    const a = aBlob(await pedir());
     S.reportes.set(llave, a);
     if (S.reportes.size > 16) { const vieja = S.reportes.keys().next().value; URL.revokeObjectURL(S.reportes.get(vieja).url); S.reportes.delete(vieja); }
     return a;
   }
+  function obtenerReporte(f) { return guardarEnMemoria(f.id + '|' + f.reporte, function () { return api('reporte.obtener', { id: f.id }); }); }
   function visor(url) {
     const img = h('img', { src: url, class: 'ajustar', alt: 'Imagen ampliada' });
     const v = h('div', { class: 'visor' }, h('button', { class: 'btn cerrar' }, '✕ Cerrar'), img);
@@ -1394,50 +1427,72 @@
     document.addEventListener('keydown', tecla, true);
     document.body.appendChild(v);
   }
+  async function accionReporte(f, accion, btn, mensaje, alCambiar) {
+    try {
+      const r = await conBoton(btn, function () { return api(accion, { id: f.id }); });
+      if (accion !== 'reporte.confirmar') olvidarReporte(f.id);
+      aplicarFila(r);
+      tostada(mensaje);
+    } catch (e) { tostada(e.message, { error: true }); }
+    refrescarDetalle(f.id);
+    if (alCambiar) alCambiar();
+  }
   /** Panel del reporte (en la ficha o en su propia ventana). */
   function panelReporte(f, alCambiar) {
     const lienzo = h('div', { class: 'lienzo' });
     const acciones = h('div', { class: 'acciones-ficha' });
-    const tit = h('div', { class: 'tit' }, h('span', null, 'Reporte del estudio', f.reporte ? h('span', { class: 'tenue', style: 'display:block;font-weight:400' }, 'Cargado el ' + fechaHora(f.repFecha) + ' por ' + f.repUsuario) : null), acciones);
+    const censo = conCensoReportes(f) && !f.anulado;
+    const revisar = porRevisar(f);
+    const boton = function (texto, clase, fn) { return h('button', { type: 'button', class: 'btn chico ' + (clase || ''), onclick: function (ev) { fn(ev.currentTarget); } }, texto); };
+    const buscar = censo ? boton(f.reporte ? 'Elegir otro del censo' : 'Buscar en el censo de reportes', '', function () { elegirDelCenso(f, alCambiar); }) : null;
+    const tit = h('div', { class: 'tit' }, h('span', null, 'Reporte del estudio',
+      h('span', { class: 'linea-rep' }, chipReporte(f), f.reporte_detalle ? h('span', { class: 'tenue' }, f.reporte_detalle) : null)), acciones);
+    const caja = h('div', { class: 'archivo' + (revisar ? ' revisar' : '') }, tit);
+    if (revisar) {
+      caja.appendChild(h('div', { class: 'aviso alerta', style: 'margin:10px 12px' }, h('b', null, '¿Este reporte es de ' + (f.nombre || 'este paciente') + '?'),
+        ' Exp. ' + (f.expediente || 's/d') + ' · nacimiento ' + (f.fecha_nacimiento || 's/d') + ' · estudio del ' + fechaCorta(f.fecha_estudio) + '. Compare con los datos del reporte antes de confirmar.'));
+    }
+    caja.appendChild(lienzo);
     if (!f.reporte) {
       lienzo.classList.add('vacio-rep');
-      lienzo.textContent = 'Aún no se ha cargado el reporte.';
-      if (!f.anulado) acciones.appendChild(h('button', { class: 'btn chico primario', onclick: function () { subirReporte(f).then(alCambiar); } }, '+ Subir reporte'));
-    } else {
-      lienzo.appendChild(h('div', null, h('div', { class: 'giro' }), h('div', { style: 'margin-top:8px' }, 'Cargando…')));
-      obtenerReporte(f).then(function (a) {
-        lienzo.textContent = '';
-        agregar(acciones, [h('a', { class: 'btn chico', href: a.url, target: '_blank', rel: 'noopener' }, 'Abrir'),
-          h('a', { class: 'btn chico', href: a.url, download: a.nombre }, 'Descargar')]);
-        if (!f.anulado) {
-          if (/^image\//.test(a.tipo)) {
-            acciones.appendChild(h('button', { class: 'btn chico', onclick: async function () {
-              const r = await abrirEditor({ blob: a.blob, original: a.blob, nombre: a.nombre }, 'Editar reporte · ' + (f.nombre || f.id));
-              if (r) { await subirReporte(f, { blob: r.blob, nombre: a.nombre.replace(/\.\w+$/, '') + '.jpg' }); alCambiar(); }
-            } }, 'Editar imagen'));
-          }
-          acciones.appendChild(h('button', { class: 'btn chico', onclick: function () { subirReporte(f).then(alCambiar); } }, 'Reemplazar'));
-          acciones.appendChild(h('button', { class: 'btn chico peligro', onclick: async function (ev) {
-            const boton = ev.currentTarget; // después de "await" ev.currentTarget ya no existe
-            if (!(await preguntar('Quitar el reporte', ['El archivo irá a la papelera de Google Drive de la cuenta del sistema (se puede recuperar durante 30 días).'], 'Quitar reporte', 'Volver', 'peligro'))) return;
-            try {
-              const r = await conBoton(boton, function () { return api('reporte.quitar', { id: f.id }); });
-              olvidarReporte(f.id);
-              aplicarFila(r);
-              tostada('Reporte quitado.');
-              alCambiar();
-            } catch (e) { tostada(e.message, { error: true }); }
-          } }, 'Quitar'));
-        }
-        if (a.tipo === 'application/pdf') {
-          if (navigator.pdfViewerEnabled) lienzo.appendChild(h('iframe', { src: a.url, title: 'Reporte PDF' }));
-          else lienzo.textContent = 'Documento PDF. Use "Abrir" para verlo.';
-        } else {
-          lienzo.appendChild(h('img', { src: a.url, alt: 'Reporte del estudio', title: 'Clic para ampliar', onclick: function () { visor(a.url); } }));
-        }
-      }).catch(function (e) { lienzo.textContent = 'No se pudo cargar: ' + e.message; });
+      lienzo.textContent = 'Aún no se ha cargado el reporte.' + (censo ? ' El reporte del ecógrafo se busca automáticamente cada hora (7:00 a. m. a 3:59 p. m.); también puede buscarlo en el censo o subir una foto o un PDF.' : '');
+      if (!f.anulado) agregar(acciones, [boton('+ Subir reporte', 'primario', function () { subirReporte(f).then(alCambiar); }), buscar]);
+      return caja;
     }
-    return h('div', { class: 'archivo' }, tit, lienzo);
+    if (revisar) {
+      agregar(acciones, [
+        boton('Sí, corresponde', 'primario', function (b) { accionReporte(f, 'reporte.confirmar', b, 'Reporte confirmado.', alCambiar); }),
+        boton('No corresponde', 'peligro', function (b) { accionReporte(f, 'reporte.quitar', b, 'Se quitó el reporte propuesto; no se volverá a proponer.', alCambiar); }),
+        buscar]);
+    }
+    lienzo.appendChild(h('div', null, h('div', { class: 'giro' }), h('div', { style: 'margin-top:8px' }, 'Cargando…')));
+    obtenerReporte(f).then(function (a) {
+      lienzo.textContent = '';
+      agregar(acciones, [h('a', { class: 'btn chico', href: a.url, target: '_blank', rel: 'noopener' }, 'Abrir'),
+        h('a', { class: 'btn chico', href: a.url, download: a.nombre }, 'Descargar')]);
+      if (!f.anulado && !revisar) {
+        if (/^image\//.test(a.tipo)) {
+          acciones.appendChild(boton('Editar imagen', '', async function () {
+            const r = await abrirEditor({ blob: a.blob, original: a.blob, nombre: a.nombre }, 'Editar reporte · ' + (f.nombre || f.id));
+            if (r) { await subirReporte(f, { blob: r.blob, nombre: a.nombre.replace(/\.\w+$/, '') + '.jpg' }); alCambiar(); }
+          }));
+        }
+        agregar(acciones, [buscar, boton('Reemplazar', '', function () { subirReporte(f).then(alCambiar); }),
+          boton('Quitar', 'peligro', async function (b) {
+            const texto = esDelCenso(f) ? ['El registro quedará sin reporte. El archivo del ecógrafo no se toca, y no se le volverá a proponer a este registro.']
+              : ['El archivo irá a la papelera de Google Drive de la cuenta del sistema (se puede recuperar durante 30 días).'];
+            if (!(await preguntar('Quitar el reporte', texto, 'Quitar reporte', 'Volver', 'peligro'))) return;
+            accionReporte(f, 'reporte.quitar', b, 'Reporte quitado.', alCambiar);
+          })]);
+      }
+      if (a.tipo === 'application/pdf') {
+        if (navigator.pdfViewerEnabled) lienzo.appendChild(h('iframe', { src: a.url, title: 'Reporte PDF' }));
+        else lienzo.textContent = 'Documento PDF. Use "Abrir" para verlo.';
+      } else {
+        lienzo.appendChild(h('img', { src: a.url, alt: 'Reporte del estudio', title: 'Clic para ampliar', onclick: function () { visor(a.url); } }));
+      }
+    }).catch(function (e) { lienzo.textContent = 'No se pudo cargar: ' + e.message; });
+    return caja;
   }
   function verReporte(f) {
     abrirModal(function (cerrar) {
@@ -1450,9 +1505,149 @@
       pintarR();
       return h('div', { class: 'modal' },
         h('div', { class: 'modal-cab' }, h('div', { style: 'min-width:0' }, h('h2', null, f.nombre || 'Paciente sin nombre'),
-          h('div', { class: 'meta' }, h('span', null, f.estudio || 'Sin estudio'), h('span', null, '·'), h('span', null, fechaLarga(f.fecha_estudio)), h('span', null, '·'), h('span', null, f.id))),
+          h('div', { class: 'meta' }, h('span', null, f.estudio || 'Sin estudio'), h('span', null, '· ' + fechaLarga(f.fecha_estudio)),
+            h('span', null, '· Exp. ' + (f.expediente || 's/d')), h('span', null, '· Nac. ' + (f.fecha_nacimiento || 's/d')), h('span', null, '· ' + f.id))),
         h('button', { class: 'btn chico x', onclick: cerrar, 'aria-label': 'Cerrar' }, '✕ Cerrar')), cuerpo);
     }, { alCerrar: function () { pintar(); } });
+  }
+
+  /** Busca en el censo de reportes (los más parecidos al paciente primero) y permite elegir el correcto. */
+  function elegirDelCenso(f, alCambiar) {
+    abrirModal(function (cerrar) {
+      const lista = h('div', { class: 'lista-censo' }, h('div', { class: 'vacio' }, 'Buscando en el censo…'));
+      const vista = h('div');
+      const err = cajaError();
+      const q = h('input', { type: 'search', id: 'censo-q', placeholder: 'Nombre, expediente o ID del paciente', autocomplete: 'off', 'data-foco': true });
+      let pedido = 0;
+      const marca = function (ok, texto) { return h('span', { class: 'chip ' + (ok ? 'ok' : 'gris') }, (ok ? '✓ ' : '✕ ') + texto); };
+      const buscar = async function () {
+        const n = ++pedido;
+        err.textContent = '';
+        try {
+          const r = await api('reportes.buscar', { id: f.id, q: q.value.trim() });
+          if (n === pedido) pintarLista(r);
+        } catch (e) { if (n === pedido) { lista.textContent = ''; mostrarError(err, e); } }
+      };
+      q.addEventListener('input', function () { clearTimeout(q._t); q._t = setTimeout(buscar, 350); });
+      const ver = async function (x, btn) {
+        try {
+          const a = await conBoton(btn, function () { return guardarEnMemoria('censo|' + x.archivo, function () { return api('reporte.archivo', { archivo: x.archivo }); }); });
+          vista.textContent = '';
+          vista.appendChild(h('div', { class: 'archivo', style: 'margin-bottom:12px' },
+            h('div', { class: 'tit' }, h('span', null, (x.paciente || x.nombre_archivo) + ' · ' + fechaHora(x.fecha_hora)),
+              h('span', { class: 'acciones-ficha' }, h('a', { class: 'btn chico', href: a.url, target: '_blank', rel: 'noopener' }, 'Abrir en otra pestaña'),
+                h('button', { type: 'button', class: 'btn chico', onclick: function () { vista.textContent = ''; } }, 'Ocultar'))),
+            h('div', { class: 'lienzo' }, navigator.pdfViewerEnabled ? h('iframe', { src: a.url, title: 'Reporte del censo' }) : 'Documento PDF. Use "Abrir en otra pestaña" para verlo.')));
+          vista.scrollIntoView({ block: 'start' });
+        } catch (e) { mostrarError(err, e); }
+      };
+      const elegir = async function (x, btn) {
+        let mover = false, otra = null;
+        for (;;) {
+          try {
+            const r = await conBoton(btn, function () { return api('reporte.vincular', { id: f.id, archivo: x.archivo, mover: mover }); });
+            olvidarReporte(f.id);
+            aplicarFila(r);
+            break;
+          } catch (e) {
+            if (e.code === 'VINCULADO_A_OTRA' && !mover) {
+              const idOtra = e.datos;
+              otra = S.filas.get(idOtra) || null;
+              const quien = otra ? ' (' + (otra.nombre || 'sin nombre') + ', ' + (otra.estudio || 'sin estudio') + ' del ' + fechaCorta(otra.fecha_estudio) + ')' : '';
+              if (!(await preguntar('Ese reporte está en otro registro', 'Está vinculado al registro ' + idOtra + quien + '. ¿Moverlo a este registro? El otro quedará sin reporte.', 'Sí, moverlo aquí', 'Cancelar'))) return;
+              mover = true;
+              continue;
+            }
+            mostrarError(err, e);
+            return;
+          }
+        }
+        if (otra) { // el otro registro quedó sin reporte
+          Object.assign(otra, { reporte: '', repTipo: '', reporte_estado: '', reporte_detalle: 'El reporte se movió al registro ' + f.id + '.' });
+          olvidarReporte(otra.id);
+        }
+        cerrar();
+        tostada('Reporte vinculado a ' + (f.nombre || f.id) + '.');
+        refrescarDetalle(f.id);
+        if (alCambiar) alCambiar();
+      };
+      const pintarLista = function (r) {
+        lista.textContent = '';
+        if (!r.reportes.length) {
+          lista.appendChild(h('div', { class: 'vacio' }, q.value.trim() ? 'Ningún reporte del censo coincide con la búsqueda.' :
+            'Ningún reporte del censo coincide con el expediente, el nombre o la fecha de nacimiento. Busque por nombre o ID.'));
+        }
+        r.reportes.forEach(function (x) {
+          const actual = x.registro === f.id;
+          lista.appendChild(h('div', { class: 'item-censo' + (actual ? ' actual' : '') },
+            h('div', { class: 'crece' }, h('b', null, x.paciente || x.nombre_archivo),
+              h('div', { class: 'tenue' }, 'ID: ' + (x.id_paciente || '—') + ' · nacimiento: ' + (x.fnac || '—') + ' · estudio: ' + (fechaHora(x.fecha_hora) || '—')),
+              h('div', { class: 'chips' }, marca(x.coincide.expediente, 'Expediente'), marca(x.coincide.nombre, 'Nombre'), marca(x.coincide.fnac, 'Nacimiento'),
+                x.registro ? h('span', { class: 'chip ' + (actual ? 'azul' : 'alerta') }, actual ? 'Es el reporte actual' : 'En el registro ' + x.registro) : null)),
+            h('div', { class: 'acciones-ficha' },
+              h('button', { type: 'button', class: 'btn chico', onclick: function (ev) { ver(x, ev.currentTarget); } }, 'Ver'),
+              actual ? null : h('button', { type: 'button', class: 'btn chico primario', onclick: function (ev) { elegir(x, ev.currentTarget); } }, 'Elegir este'))));
+        });
+        lista.appendChild(h('p', { class: 'tenue', style: 'margin:10px 0 0;font-size:13px' }, 'Reportes en el censo: ' + r.total_censo + '. Se muestran hasta 40, primero los que más coinciden y los más cercanos a la fecha del estudio.'));
+      };
+      buscar();
+      return h('div', { class: 'modal' },
+        h('div', { class: 'modal-cab' },
+          h('div', { style: 'min-width:0' }, h('h2', null, 'Elegir reporte del censo'),
+            h('div', { class: 'meta' }, h('span', null, f.nombre || 'Sin nombre'), h('span', null, '· Exp. ' + (f.expediente || 's/d')), h('span', null, '· Nac. ' + (f.fecha_nacimiento || 's/d')),
+              h('span', null, '· Estudio del ' + fechaCorta(f.fecha_estudio)))),
+          h('button', { class: 'btn chico x', onclick: cerrar, 'aria-label': 'Cerrar' }, '✕ Cerrar')),
+        h('div', { class: 'modal-cuerpo formulario' }, vista,
+          h('div', { class: 'campo' }, h('label', { for: 'censo-q' }, 'Buscar (vacío = los que coinciden con el paciente)'), q), err, lista));
+    });
+  }
+
+  /* ---- comentario con plantillas ---- */
+  function seccionComentario(f0) {
+    let f = f0;
+    let guardado = f.comentario || '';
+    const txt = h('textarea', { id: 'comentario-txt', rows: '5', maxlength: '5000', placeholder: 'Comentario sobre el estudio o el paciente…', 'aria-label': 'Comentario' });
+    txt.value = guardado;
+    const info = h('span', { class: 'tenue' });
+    const pintarInfo = function () {
+      const cambios = txt.value !== guardado;
+      info.textContent = (cambios ? 'Sin guardar · ' : f.comentario_por ? 'Guardado por ' + f.comentario_por + ' · ' : '') + txt.value.length + '/5000';
+      info.classList.toggle('sin-guardar', cambios);
+    };
+    txt.addEventListener('input', pintarInfo);
+    const plantillas = S.plantillas.filter(function (p) { return !p.estudio || p.estudio === f.estudio; });
+    // Al elegir una plantilla se inserta donde está el cursor (o llena el cuadro si está vacío).
+    const sel = plantillas.length ? selector([['', 'Insertar plantilla…']].concat(plantillas.map(function (p, i) { return [String(i), p.nombre]; })), '',
+      { id: 'plantilla-sel', 'aria-label': 'Insertar plantilla', onchange: function () {
+        if (sel.value === '') return;
+        const p = plantillas[Number(sel.value)];
+        sel.value = '';
+        const v = txt.value;
+        if (!v.trim()) txt.value = p.texto;
+        else {
+          const ini = typeof txt.selectionStart === 'number' ? txt.selectionStart : v.length, fin = typeof txt.selectionEnd === 'number' ? txt.selectionEnd : v.length;
+          const antes = v.slice(0, ini), despues = v.slice(fin);
+          txt.value = antes + (antes && !/\n$/.test(antes) ? '\n' : '') + p.texto + (despues && !/^\n/.test(despues) ? '\n' : '') + despues;
+        }
+        txt.focus();
+        pintarInfo();
+      } }) : null;
+    const guardar = h('button', { type: 'button', class: 'btn primario', id: 'comentario-guardar', onclick: async function (ev) {
+      try {
+        const r = await conBoton(ev.currentTarget, function () { return api('comentario.guardar', { id: f.id, texto: txt.value }); });
+        f = aplicarFila(r);
+        txt.value = guardado = f.comentario || '';
+        pintarInfo();
+        tostada(guardado ? 'Comentario guardado.' : 'Comentario borrado.');
+      } catch (e) { tostada(e.message, { error: true }); }
+    } }, 'Guardar comentario');
+    pintarInfo();
+    return {
+      sinGuardar: function () { return txt.value !== guardado; },
+      seccion: h('section', { class: 'ficha todo comentario' }, h('h3', null, 'Comentario'), txt,
+        h('div', { class: 'barra-com' }, info, h('div', { class: 'acciones-ficha' }, sel ||
+          (esAdmin() ? h('span', { class: 'tenue', style: 'font-size:13px' }, 'Puede crear plantillas en "Usuarios y médicos".') : null), guardar)))
+    };
   }
 
   /* ---- ficha completa ---- */
@@ -1462,6 +1657,8 @@
     let f = f0;
     const cuerpo = h('div', { class: 'modal-cuerpo' });
     const cab = h('div', { style: 'min-width:0' });
+    // El comentario se crea una sola vez: lo escrito no se pierde cuando la ficha se vuelve a dibujar.
+    const comentario = seccionComentario(f);
     const pintarFicha = function () {
       cab.textContent = '';
       cuerpo.textContent = '';
@@ -1492,6 +1689,7 @@
           h('div', { class: 'tenue', style: 'flex:1 1 200px;padding-bottom:10px' }, 'Registrado el ' + fechaHora(f.fecha_hora) + (f.registrado_por ? ' por ' + f.registrado_por : '') +
             (f.modificado ? ' · última modificación ' + fechaHora(f.modificado.split(' · ')[0]) + ' por ' + (f.modificado.split(' · ')[1] || '') : '')))),
         h('section', { class: 'todo' }, panelReporte(f, function () { f = S.filas.get(f.id) || f; pintarFicha(); })),
+        comentario.seccion,
         h('section', { class: 'todo acciones-ficha' },
           !f.anulado ? h('button', { class: 'btn primario', onclick: function () { editarRegistro(f); } }, 'Editar datos') : null,
           !f.anulado ? h('button', { class: 'btn peligro', onclick: function (ev) { anular(f, true, ev.currentTarget); } }, 'Anular registro') : null,
@@ -1500,9 +1698,12 @@
     };
     pintarFicha();
     S.detalleAbierto = { id: f.id, fn: function (x) { if (x) f = x; pintarFicha(); } };
-    abrirModal(function (cerrar) {
-      return h('div', { class: 'modal' }, h('div', { class: 'modal-cab' }, cab, h('button', { class: 'btn chico x', onclick: cerrar, 'aria-label': 'Cerrar' }, '✕ Cerrar')), cuerpo);
-    }, { alCerrar: function () { S.detalleAbierto = null; pintar(); } });
+    abrirModal(function (cerrar, intentarCerrar) {
+      return h('div', { class: 'modal' }, h('div', { class: 'modal-cab' }, cab, h('button', { class: 'btn chico x', onclick: intentarCerrar, 'aria-label': 'Cerrar' }, '✕ Cerrar')), cuerpo);
+    }, { alCerrar: function () { S.detalleAbierto = null; pintar(); },
+      antesDeCerrar: function () {
+        return !comentario.sinGuardar() || preguntar('Comentario sin guardar', 'Escribió un comentario que todavía no se ha guardado.', 'Cerrar sin guardar', 'Seguir editando', 'peligro');
+      } });
   }
   async function anular(f, valor, btn) {
     if (valor && !(await preguntar('Anular registro', ['El registro de ' + (f.nombre || f.id) + ' (' + (f.estudio || 'sin estudio') + ') dejará de contar en el censo y en las estadísticas.',
@@ -1580,9 +1781,12 @@
     if (clave === '30') return [sumarDias(d, -30), d];
     return ['', ''];
   }
-  function vistaCenso(main) {
+  function uiCenso() {
     const r30 = rangoRapido('30');
-    const u = ui('censo', { orden: 'fecha', dir: -1, desde: r30[0], hasta: r30[1], rapido: '30', estudio: '', proc: '', medico: '', reporte: '', anulados: false, falta: '' });
+    return ui('censo', { orden: 'fecha', dir: -1, desde: r30[0], hasta: r30[1], rapido: '30', estudio: '', proc: '', medico: '', reporte: '', anulados: false, falta: '' });
+  }
+  function vistaCenso(main) {
+    const u = uiCenso();
     const err = cajaError();
     const enRango = filasArr().filter(function (f) { return (!u.desde || f.fecha_estudio >= u.desde) && (!u.hasta || f.fecha_estudio <= u.hasta); });
     const base = enRango.filter(function (f) {
@@ -1590,15 +1794,17 @@
       if (u.estudio && f.estudio !== u.estudio && !(u.estudio === OTRO && /^Otro: /.test(f.estudio))) return false;
       if (u.proc && f.procedencia !== u.proc && !(u.proc === OTRO && /^Otro: /.test(f.procedencia))) return false;
       if (u.medico === '-' ? f.estado !== 'PENDIENTE' : u.medico === 'NO' ? f.estado !== 'NO REALIZADO' : u.medico && f.realizado_por !== u.medico) return false;
-      if (u.reporte && (u.reporte === 'con') !== !!f.reporte) return false;
+      if (u.reporte === 'con' ? !conReporte(f) : u.reporte === 'sin' ? !!f.reporte : u.reporte === 'revisar' ? !porRevisar(f) : false) return false;
       return true;
     });
     const activos = base.filter(function (f) { return !f.anulado; });
     const nSinMedico = activos.filter(function (f) { return f.estado === 'PENDIENTE'; }).length;
     const nSinReporte = activos.filter(function (f) { return f.estado === 'REALIZADO' && !f.reporte; }).length;
+    const nRevisar = activos.filter(porRevisar).length;
     const filas = base.filter(function (f) {
       if (u.falta === 'medico') return f.estado === 'PENDIENTE' && !f.anulado;
       if (u.falta === 'reporte') return f.estado === 'REALIZADO' && !f.reporte && !f.anulado;
+      if (u.falta === 'revisar') return porRevisar(f);
       return true;
     });
     const q = norm(u.q.trim());
@@ -1654,12 +1860,13 @@
         sel('f-estudio', 'Estudio', [['', 'Todos']].concat(usados('estudio', ESTUDIOS).map(function (x) { return [x, x === OTRO ? 'Otros' : x]; })), u.estudio, function (v) { u.estudio = v; }),
         sel('f-proc', 'Proviene de', [['', 'Todos']].concat(usados('procedencia', PROCEDENCIAS).map(function (x) { return [x, x === OTRO ? 'Otros' : procCorta(x)]; })), u.proc, function (v) { u.proc = v; }),
         sel('f-medico', 'Realizado por', [['', 'Todos'], ['-', 'Sin indicar'], ['NO', 'No se realizó']].concat(medicosOp), u.medico, function (v) { u.medico = v; }),
-        sel('f-rep', 'Reporte', [['', 'Todos'], ['con', 'Con reporte'], ['sin', 'Sin reporte']], u.reporte, function (v) { u.reporte = v; }),
+        sel('f-rep', 'Reporte', [['', 'Todos'], ['con', 'Con reporte'], ['sin', 'Sin reporte'], ['revisar', 'Por revisar']], u.reporte, function (v) { u.reporte = v; }),
         h('label', { class: 'interruptor', style: 'min-height:42px' }, h('input', { type: 'checkbox', id: 'f-anulados', checked: u.anulados, onchange: function (ev) { u.anulados = ev.target.checked; pintar(); } }), 'Mostrar anulados')),
       h('div', { class: 'resumen-censo' },
         h('button', { type: 'button', 'aria-pressed': String(!u.falta), onclick: function () { u.falta = ''; pintar(); } }, h('b', null, activos.length), ' ', activos.length === 1 ? 'registro' : 'registros'),
         h('button', { type: 'button', id: 'falta-medico', 'aria-pressed': String(u.falta === 'medico'), onclick: function () { u.falta = u.falta === 'medico' ? '' : 'medico'; pintar(); } }, h('b', null, nSinMedico), ' sin indicar quién lo realizó'),
-        h('button', { type: 'button', id: 'falta-reporte', 'aria-pressed': String(u.falta === 'reporte'), onclick: function () { u.falta = u.falta === 'reporte' ? '' : 'reporte'; pintar(); } }, h('b', null, nSinReporte), ' realizados sin reporte')),
+        h('button', { type: 'button', id: 'falta-reporte', 'aria-pressed': String(u.falta === 'reporte'), onclick: function () { u.falta = u.falta === 'reporte' ? '' : 'reporte'; pintar(); } }, h('b', null, nSinReporte), ' realizados sin reporte'),
+        nRevisar || u.falta === 'revisar' ? h('button', { type: 'button', id: 'falta-revisar', class: 'revisar', 'aria-pressed': String(u.falta === 'revisar'), onclick: function () { u.falta = u.falta === 'revisar' ? '' : 'revisar'; pintar(); } }, h('b', null, nRevisar), ' reportes por revisar') : null),
       tabla(visibles, u, { columnas: ['marcar', 'reporte', 'fecha', 'paciente', 'edad', 'procedencia', 'estudio'], vacio: 'No hay registros con estos filtros.' }),
       h('p', { class: 'no-imprimir tenue', style: 'font-size:13.5px' }, (S.desde > '0000-01-01' ? 'Datos cargados desde el ' + fechaCorta(S.desde) + '. Para fechas anteriores cambie "Desde" o use "Todo el historial". ' : 'Historial completo cargado. ') +
         'Toque un paciente para ver la ficha completa, editar sus datos o anular el registro.')
@@ -1685,8 +1892,8 @@
     const cols = [['id', 'Registro'], ['fecha_estudio', 'Fecha del estudio'], ['fecha_hora', 'Registrado'], ['estudio', 'Estudio'], ['procedencia', 'Proviene de'],
       ['expediente', 'Expediente'], ['nombre', 'Paciente'], ['fecha_nacimiento', 'Fecha de nacimiento'], ['edad', 'Edad'], ['sexo', 'Sexo'],
       ['diagnostico', 'Diagnósticos previos'], ['pa', 'Presión arterial'], ['fc', 'FC'], ['fr', 'FR'], ['sato2', 'SatO2'], ['peso', 'Peso (kg)'], ['talla', 'Talla (cm)'],
-      ['estado', 'Estado'], ['realizado_por', 'Realizado por'], ['motivo_no', 'Motivo de no realización'], ['hallazgos', 'Hallazgos'], ['repTipo', 'Reporte'],
-      ['observaciones', 'Observaciones'], ['registrado_por', 'Registrado por'], ['anulado', 'Anulado'], ['origen', 'Origen']];
+      ['estado', 'Estado'], ['realizado_por', 'Realizado por'], ['motivo_no', 'Motivo de no realización'], ['hallazgos', 'Hallazgos'], ['repTipo', 'Reporte'], ['reporte_estado', 'Estado del reporte'],
+      ['observaciones', 'Observaciones'], ['comentario', 'Comentario'], ['comentario_por', 'Comentario guardado por'], ['registrado_por', 'Registrado por'], ['anulado', 'Anulado'], ['origen', 'Origen']];
     const lineas = [cols.map(function (c) { return celdaCsv(c[1]); }).join(',')];
     filas.forEach(function (f) { lineas.push(cols.map(function (c) { return celdaCsv(f[c[0]]); }).join(',')); });
     descargar('censo_ambulatorio_' + hoy() + '.csv', lineas.join('\r\n'));
@@ -1876,7 +2083,9 @@
           h('div', { class: 'campo' }, h('label', { for: 'nu-r' }, 'Rol'), nu.rol),
           h('div', { class: 'campo' }, h('label', { for: 'nu-c' }, 'Contraseña temporal'), nu.clave),
           h('button', { class: 'btn oscuro', type: 'submit' }, 'Crear usuario')),
-        errU)
+        errU),
+      panelPlantillas(),
+      panelReportes()
     ]);
   }
   function restablecer(x) {
@@ -1892,9 +2101,88 @@
     });
   }
 
+  /* ---------- plantillas de comentario ---------- */
+  function panelPlantillas() {
+    const guardar = async function (lista, mensaje) {
+      const r = await api('plantillas.guardar', { plantillas: lista });
+      S.plantillas = r.plantillas;
+      pintar();
+      tostada(mensaje);
+    };
+    const editar = function (i) {
+      const p = i >= 0 ? S.plantillas[i] : { nombre: '', estudio: '', texto: '' };
+      modalChico(i >= 0 ? 'Editar plantilla' : 'Nueva plantilla', function (cerrar) {
+        const err = cajaError();
+        const nombre = h('input', { type: 'text', id: 'pl-n', maxlength: '60', value: p.nombre, 'data-foco': true, placeholder: 'Ej. Ecocardiograma normal' });
+        const estudio = selector([['', 'Todos los estudios']].concat(ESTUDIOS.map(function (e) { return [e, e]; })), p.estudio, { id: 'pl-e' });
+        const texto = h('textarea', { id: 'pl-t', rows: '9', maxlength: '5000' });
+        texto.value = p.texto;
+        const btn = h('button', { class: 'btn primario ancho', type: 'submit' }, 'Guardar plantilla');
+        return h('form', { onsubmit: async function (ev) {
+          ev.preventDefault();
+          const lista = S.plantillas.slice();
+          const nueva = { nombre: nombre.value, estudio: estudio.value, texto: texto.value };
+          if (i >= 0) lista[i] = nueva; else lista.push(nueva);
+          try { await conBoton(btn, function () { return guardar(lista, i >= 0 ? 'Plantilla actualizada.' : 'Plantilla agregada.'); }); cerrar(); } catch (e) { mostrarError(err, e); }
+        } },
+        h('div', { class: 'campo' }, h('label', { for: 'pl-n' }, 'Nombre'), nombre),
+        h('div', { class: 'campo' }, h('label', { for: 'pl-e' }, 'Aparece en'), estudio),
+        h('div', { class: 'campo' }, h('label', { for: 'pl-t' }, 'Texto'), texto), err, btn);
+      });
+    };
+    return h('section', { class: 'panel' }, h('h3', null, 'Plantillas de comentario'),
+      h('p', { class: 'sub' }, 'Textos prehechos que se insertan en el comentario de cada registro (en la ficha del Censo). Si elige un estudio, la plantilla solo aparece en los registros de ese estudio.'),
+      S.plantillas.length ? h('ul', { class: 'lista-simple' }, S.plantillas.map(function (p, i) {
+        return h('li', null, h('span', { class: 'crece' }, h('b', null, p.nombre), ' · ' + (p.estudio || 'Todos los estudios'), h('div', { class: 'tenue recorte' }, p.texto)),
+          h('button', { class: 'btn chico', onclick: function () { editar(i); } }, 'Editar'),
+          h('button', { class: 'btn chico peligro', onclick: async function () {
+            if (!(await preguntar('¿Eliminar la plantilla?', '"' + p.nombre + '" dejará de aparecer. Los comentarios ya guardados no cambian.', 'Sí, eliminar', 'Cancelar', 'peligro'))) return;
+            try { await guardar(S.plantillas.filter(function (x, j) { return j !== i; }), 'Plantilla eliminada.'); } catch (e) { tostada(e.message, { error: true }); }
+          } }, 'Eliminar'));
+      })) : h('p', { class: 'tenue', style: 'margin:0' }, 'Aún no hay plantillas.'),
+      h('button', { class: 'btn oscuro', id: 'pl-nueva', style: 'margin-top:12px', onclick: function () { editar(-1); } }, 'Nueva plantilla'));
+  }
+
+  /* ---------- censo automático de reportes ---------- */
+  function panelReportes() {
+    const titulo = h('h3', null, 'Censo automático de reportes de ecocardiograma');
+    const e = S.estadoReportes;
+    if (!e || e.cargando) {
+      if (!e) {
+        S.estadoReportes = { cargando: true };
+        api('reportes.estado').then(function (r) { S.estadoReportes = r; }).catch(function (x) { S.estadoReportes = { error: x.message }; })
+          .then(function () { if (ruta()[0] === 'admin' && !modalesAbiertos()) pintar(); });
+      }
+      return h('section', { class: 'panel' }, titulo, h('div', { class: 'vacio' }, 'Cargando…'));
+    }
+    if (e.error) return h('section', { class: 'panel' }, titulo, h('div', { class: 'aviso error' }, e.error));
+    const ejecutar = async function (btn, completo) {
+      if (completo && !(await preguntar('¿Revisar toda la carpeta?', 'Se revisan todos los PDF de la carpeta de reportes, no solo los nuevos. Los que ya están en el censo no se duplican. Puede tardar unos minutos.', 'Sí, revisar todo', 'Cancelar'))) return;
+      try {
+        const r = await conBoton(btn, function () { return api('reportes.ejecutar', { completo: !!completo }); });
+        S.estadoReportes = r;
+        const x = r.resultado;
+        tostada(plural(x.nuevos, 'reporte nuevo', 'reportes nuevos') + ' en el censo · ' + plural(x.automaticos, 'vinculado', 'vinculados') + ' · ' + x.revisar + ' por revisar');
+        await sincronizar(true);
+      } catch (err) { tostada(err.message, { error: true }); }
+      pintar();
+    };
+    return h('section', { class: 'panel', id: 'panel-reportes' }, titulo,
+      h('p', { class: 'sub' }, 'Cada hora, de ' + e.horario + ', los PDF nuevos de la carpeta del ecógrafo se agregan a la pestaña "Reportes" de la hoja. Quince minutos después se busca el reporte de cada ecocardiograma (transtorácico y transesofágico) registrado sin reporte: si coinciden expediente, nombre y fecha de nacimiento se vincula solo; si coinciden dos datos (siempre el nombre), queda "por revisar". El sistema solo lee esa carpeta: nunca mueve ni borra sus archivos.'),
+      !e.drive_api ? h('div', { class: 'aviso error' }, 'Falta activar el servicio "Drive API" en el editor de Apps Script. Vea la guía de instalación, sección 11.') : null,
+      e.drive_api && !e.activo ? h('div', { class: 'aviso alerta' }, 'La revisión automática no está activada. En el editor de Apps Script ejecute una vez la función "activarReportes" (guía de instalación, sección 11).') : null,
+      h('dl', { class: 'datos' }, dato('Revisión automática', e.activo ? 'Activa' : 'Inactiva'), dato('Estudios desde', fechaCorta(e.desde)),
+        dato('Último censo', e.ultimo_censo), dato('Última vinculación', e.ultima_vinculacion),
+        dato('Reportes en el censo', String(e.censados)), dato('Vinculados', String(e.vinculados)), dato('Por revisar', String(e.por_revisar))),
+      h('div', { class: 'acciones-ficha', style: 'margin-top:14px' },
+        h('button', { class: 'btn oscuro', id: 'censar-ahora', disabled: !e.drive_api, onclick: function (ev) { ejecutar(ev.currentTarget, false); } }, 'Censar y vincular ahora'),
+        h('button', { class: 'btn', disabled: !e.drive_api, onclick: function (ev) { ejecutar(ev.currentTarget, true); } }, 'Revisar toda la carpeta'),
+        h('a', { class: 'btn', href: 'https://drive.google.com/drive/folders/' + e.carpeta, target: '_blank', rel: 'noopener' }, 'Abrir la carpeta de reportes')));
+  }
+
   /* ============================== arranque ============================== */
   window.addEventListener('hashchange', function () {
-    if (ruta()[0] !== 'admin') S.usuarios = null;
+    if (ruta()[0] !== 'admin') S.usuarios = S.estadoReportes = null;
     $capas.textContent = '';
     document.body.style.overflow = '';
     S.detalleAbierto = null;
